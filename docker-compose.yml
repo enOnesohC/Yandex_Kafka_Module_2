@@ -1,0 +1,186 @@
+services:
+  redis:
+    image: redis:7.4-alpine
+    container_name: words-redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --appendonly yes
+      --appendfsync everysec
+      --maxmemory 256mb
+      --maxmemory-policy noeviction
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    networks:
+      - kafka-net
+
+  badwords-api:
+    build:
+      context: ./BadWordsService
+      dockerfile: Dockerfile
+    container_name: words-api
+    restart: unless-stopped
+    command: uvicorn BadWordsService:app --host 0.0.0.0 --port 8000
+    environment:
+      REDIS_URL: ${REDIS_URL}
+      WORDS_KEY: badwords
+      SEED_ON_EMPTY: "true"
+    ports:
+      - "8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks:
+      - kafka-net
+
+  kafka-0:
+    image: bitnamilegacy/kafka:3.4
+    ports:
+      - "9094:9094"
+    environment:
+      - KAFKA_ENABLE_KRAFT=yes
+      - ALLOW_PLAINTEXT_LISTENER=yes
+      - KAFKA_CFG_NODE_ID=0
+      - KAFKA_CFG_PROCESS_ROLES=broker,controller
+      - KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER
+      - KAFKA_CFG_CONTROLLER_QUORUM_VOTERS=0@kafka-0:9093,1@kafka-1:9093,2@kafka-2:9093
+      - KAFKA_KRAFT_CLUSTER_ID=abcdefghijklmnopqrstuv
+      - KAFKA_CFG_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094
+      - KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://kafka-0:9092,EXTERNAL://127.0.0.1:9094
+      - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT,PLAINTEXT:PLAINTEXT
+    volumes:
+      - kafka_0_data:/bitnami/kafka
+    networks:
+      - kafka-net
+
+  kafka-1:
+    image: bitnamilegacy/kafka:3.4
+    ports:
+      - "9095:9095"
+    environment:
+      - KAFKA_ENABLE_KRAFT=yes
+      - ALLOW_PLAINTEXT_LISTENER=yes
+      - KAFKA_CFG_NODE_ID=1
+      - KAFKA_CFG_PROCESS_ROLES=broker,controller
+      - KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER
+      - KAFKA_CFG_CONTROLLER_QUORUM_VOTERS=0@kafka-0:9093,1@kafka-1:9093,2@kafka-2:9093
+      - KAFKA_KRAFT_CLUSTER_ID=abcdefghijklmnopqrstuv
+      - KAFKA_CFG_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9095
+      - KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://kafka-1:9092,EXTERNAL://127.0.0.1:9095
+      - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT,PLAINTEXT:PLAINTEXT
+    volumes:
+      - kafka_1_data:/bitnami/kafka
+    networks:
+      - kafka-net
+
+  kafka-2:
+    image: bitnamilegacy/kafka:3.4
+    ports:
+      - "9096:9096"
+    environment:
+      - KAFKA_ENABLE_KRAFT=yes
+      - ALLOW_PLAINTEXT_LISTENER=yes
+      - KAFKA_CFG_NODE_ID=2
+      - KAFKA_CFG_PROCESS_ROLES=broker,controller
+      - KAFKA_CFG_CONTROLLER_LISTENER_NAMES=CONTROLLER
+      - KAFKA_CFG_CONTROLLER_QUORUM_VOTERS=0@kafka-0:9093,1@kafka-1:9093,2@kafka-2:9093
+      - KAFKA_KRAFT_CLUSTER_ID=abcdefghijklmnopqrstuv
+      - KAFKA_CFG_LISTENERS=PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9096
+      - KAFKA_CFG_ADVERTISED_LISTENERS=PLAINTEXT://kafka-2:9092,EXTERNAL://127.0.0.1:9096
+      - KAFKA_CFG_LISTENER_SECURITY_PROTOCOL_MAP=CONTROLLER:PLAINTEXT,EXTERNAL:PLAINTEXT,PLAINTEXT:PLAINTEXT
+    volumes:
+      - kafka_2_data:/bitnami/kafka
+    networks:
+      - kafka-net
+
+
+  kafka-init:
+    image: bitnamilegacy/kafka:3.4
+    depends_on:
+      - kafka-0
+      - kafka-1
+      - kafka-2
+    entrypoint: [ "/bin/sh", "-c" ]
+    command: >
+      set -e;
+      BOOTSTRAP=kafka-0:9092,kafka-1:9092,kafka-2:9092;
+
+      echo 'waiting for kafka...';
+      until kafka-topics.sh --bootstrap-server $BOOTSTRAP --list >/dev/null 2>&1; do
+        sleep 2;
+      done;
+
+      echo 'waiting for all 3 brokers...';
+      until [ "$(kafka-topics.sh --bootstrap-server $BOOTSTRAP --list 2>/dev/null | wc -l)" != "" ] && \
+            kafka-broker-api-versions.sh --bootstrap-server $BOOTSTRAP >/dev/null 2>&1; do
+        sleep 2;
+      done;
+
+      kafka-topics.sh --bootstrap-server $BOOTSTRAP \
+        --create --if-not-exists --topic messages \
+        --partitions 3 --replication-factor 2;
+
+      kafka-topics.sh --bootstrap-server $BOOTSTRAP \
+        --create --if-not-exists --topic filtered_messages \
+        --partitions 3 --replication-factor 2;
+
+      kafka-topics.sh --bootstrap-server $BOOTSTRAP \
+        --create --if-not-exists --topic blocked_users \
+        --partitions 3 --replication-factor 2 \
+        --config cleanup.policy=compact;
+
+      echo 'topics ready';
+      kafka-topics.sh --bootstrap-server $BOOTSTRAP --list;
+    networks:
+      - kafka-net
+    restart: "no"
+
+  ui:
+    image: provectuslabs/kafka-ui:v0.7.0
+    ports:
+      - "8080:8080"
+    environment:
+      - KAFKA_CLUSTERS_0_BOOTSTRAP_SERVERS=kafka-0:9092,kafka-1:9092,kafka-2:9092
+      - KAFKA_CLUSTERS_0_NAME=kraft-cluster
+    depends_on:
+      - kafka-0
+      - kafka-1
+      - kafka-2
+    networks:
+      - kafka-net
+
+  filter-service:
+    build:
+      context: ./StreamReader
+      dockerfile: Dockerfile
+    container_name: filter-service
+    restart: unless-stopped
+    environment:
+      KAFKA_BROKER: ${KAFKA_BROKER}
+      REDIS_URL: ${REDIS_URL}
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    networks:
+      - kafka-net
+
+
+networks:
+  kafka-net:
+    driver: bridge
+
+volumes:
+  redis-data:
+  kafka_0_data:
+  kafka_1_data:
+  kafka_2_data:

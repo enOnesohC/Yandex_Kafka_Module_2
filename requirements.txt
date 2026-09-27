@@ -1,0 +1,7 @@
+faust-streaming
+fastapi
+uvicorn
+redis
+pydantic
+confluent-kafka
+python-dotenv
